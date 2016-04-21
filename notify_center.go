@@ -13,6 +13,7 @@ package main
 import (
 	log "github.com/cihub/seelog"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ import (
 type NotifyCenter struct {
 	app            *ApplicationContext
 	interval       int64
+	notifiers      []*Notifier
 	refreshTicker  *time.Ticker
 	quitChan       chan struct{}
 	groupIds       map[string]map[string]event
@@ -31,6 +33,47 @@ type NotifyCenter struct {
 type event struct {
 	Id    string
 	Start time.Time
+}
+
+func LoadNotifiers(app *ApplicationContext) error {
+	// TODO add all available notifiers
+	return nil
+}
+
+func StartNotifiers(app *ApplicationContext) {
+	nc := app.NotifyCenter
+	// Do not proceed until we get the Zookeeper lock
+	err := app.NotifierLock.Lock()
+	if err != nil {
+		log.Criticalf("Cannot get ZK nc lock: %v", err)
+		os.Exit(1)
+	}
+	log.Info("Acquired Zookeeper notify lock")
+	// Get a group list to start with (this will start the ncs)
+	nc.refreshConsumerGroups()
+
+	// Set a ticker to refresh the group list periodically
+	nc.refreshTicker = time.NewTicker(time.Duration(nc.app.Config.Lagcheck.ZKGroupRefresh) * time.Second)
+
+	// Main loop to handle refreshes and evaluation responses
+OUTERLOOP:
+	for {
+		select {
+		case <-nc.quitChan:
+			break OUTERLOOP
+		case <-nc.refreshTicker.C:
+			nc.refreshConsumerGroups()
+		case result := <-nc.resultsChannel:
+			go nc.handleEvaluationResponse(result)
+		}
+	}
+}
+
+func StopNotifiers(app *ApplicationContext) {
+	// Ignore errors on unlock - we're quitting anyways, and it might not be locked
+	app.NotifierLock.Unlock()
+
+	// TODO stop all notifiers
 }
 
 func NewNotifyCenter(app *ApplicationContext) (*NotifyCenter, error) {
