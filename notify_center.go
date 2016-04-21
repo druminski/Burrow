@@ -21,22 +21,40 @@ import (
 type NotifyCenter struct {
 	app            *ApplicationContext
 	interval       int64
-	notifiers      []*Notifier
+	notifiers      []Notifier
 	refreshTicker  *time.Ticker
 	quitChan       chan struct{}
-	groupIds       map[string]map[string]event
 	groupList      map[string]map[string]bool
 	groupLock      sync.RWMutex
 	resultsChannel chan *ConsumerGroupStatus
 }
 
-type event struct {
-	Id    string
-	Start time.Time
-}
-
 func LoadNotifiers(app *ApplicationContext) error {
-	// TODO add all available notifiers
+	notifiers := []Notifier{}
+	if app.Config.Httpnotifier.Enable {
+		if httpNotifier, err := NewHttpNotifier(app); err == nil {
+			notifiers = append(notifiers, httpNotifier)
+		}
+	}
+	if len(app.Config.Emailnotifier) > 0 {
+		if emailNotifiers, err := NewEmailNotifier(app); err == nil {
+			for _, emailer := range emailNotifiers {
+				notifiers = append(notifiers, emailer)
+			}
+		}
+	}
+
+	nc := &NotifyCenter{
+		app:            app,
+		notifiers:      notifiers,
+		interval:       app.Config.Notify.Interval,
+		quitChan:       make(chan struct{}),
+		groupList:      make(map[string]map[string]bool),
+		groupLock:      sync.RWMutex{},
+		resultsChannel: make(chan *ConsumerGroupStatus),
+	}
+
+	app.NotifyCenter = nc
 	return nil
 }
 
@@ -72,23 +90,23 @@ OUTERLOOP:
 func StopNotifiers(app *ApplicationContext) {
 	// Ignore errors on unlock - we're quitting anyways, and it might not be locked
 	app.NotifierLock.Unlock()
-
-	// TODO stop all notifiers
+	nc := app.NotifyCenter
+	if nc.refreshTicker != nil {
+		nc.refreshTicker.Stop()
+		nc.groupLock.Lock()
+		nc.groupList = make(map[string]map[string]bool)
+		nc.groupLock.Unlock()
+	}
+	close(nc.quitChan)
+	// TODO stop all ncs
 }
 
-func NewNotifyCenter(app *ApplicationContext) (*NotifyCenter, error) {
-	return &NotifyCenter{
-		app:            app,
-		quitChan:       make(chan struct{}),
-		groupIds:       make(map[string]map[string]event),
-		groupList:      make(map[string]map[string]bool),
-		groupLock:      sync.RWMutex{},
-		resultsChannel: make(chan *ConsumerGroupStatus),
-	}, nil
-}
-
-func (notifier *NotifyCenter) handleEvaluationResponse(result *ConsumerGroupStatus) {
-	// TODO: notify all
+func (nc *NotifyCenter) handleEvaluationResponse(result *ConsumerGroupStatus) {
+	for _, notifier := range nc.notifiers {
+		if !notifier.Ignore(result) {
+			notifier.Notify(result)
+		}
+	}
 }
 
 func (notifier *NotifyCenter) refreshConsumerGroups() {
@@ -116,7 +134,7 @@ func (notifier *NotifyCenter) refreshConsumerGroups() {
 
 			if _, ok := clusterGroups[consumerGroup]; !ok {
 				// Add new consumer group and start checking it
-				log.Debugf("Start evaluating consumer group %s in cluster %s", consumerGroup, cluster)
+				log.Infof("Start evaluating consumer group %s in cluster %s", consumerGroup, cluster)
 				go notifier.startConsumerGroupEvaluator(consumerGroup, cluster)
 			}
 			clusterGroups[consumerGroup] = true
@@ -153,37 +171,4 @@ func (notifier *NotifyCenter) startConsumerGroupEvaluator(group string, cluster 
 		// Sleep for the check interval
 		time.Sleep(time.Duration(notifier.interval) * time.Second)
 	}
-}
-
-func (notifier *NotifyCenter) Start() {
-	// Get a group list to start with (this will start the notifiers)
-	notifier.refreshConsumerGroups()
-
-	// Set a ticker to refresh the group list periodically
-	notifier.refreshTicker = time.NewTicker(time.Duration(notifier.app.Config.Lagcheck.ZKGroupRefresh) * time.Second)
-
-	// Main loop to handle refreshes and evaluation responses
-	go func() {
-	OUTERLOOP:
-		for {
-			select {
-			case <-notifier.quitChan:
-				break OUTERLOOP
-			case <-notifier.refreshTicker.C:
-				notifier.refreshConsumerGroups()
-			case result := <-notifier.resultsChannel:
-				go notifier.handleEvaluationResponse(result)
-			}
-		}
-	}()
-}
-
-func (notifier *NotifyCenter) Stop() {
-	if notifier.refreshTicker != nil {
-		notifier.refreshTicker.Stop()
-		notifier.groupLock.Lock()
-		notifier.groupList = make(map[string]map[string]bool)
-		notifier.groupLock.Unlock()
-	}
-	close(notifier.quitChan)
 }
