@@ -24,6 +24,11 @@ import (
 )
 
 // Configuration definition
+type ClientProfile struct {
+	ClientID    string `gcfg:"client-id"`
+	TLS         bool   `gcfg:"tls"`
+	TLSNoVerify bool   `gcfg:"tls-noverify"`
+}
 type BurrowConfig struct {
 	General struct {
 		LogDir         string `gcfg:"logdir"`
@@ -46,6 +51,7 @@ type BurrowConfig struct {
 		ZookeeperPath string   `gcfg:"zookeeper-path"`
 		OffsetsTopic  string   `gcfg:"offsets-topic"`
 		ZKOffsets     bool     `gcfg:"zookeeper-offsets"`
+		Clientprofile string   `gcfg:"client-profile"`
 	}
 	Storm map[string]*struct {
 		Zookeepers    []string `gcfg:"zookeeper"`
@@ -112,6 +118,7 @@ type BurrowConfig struct {
 		Timeout   int      `gcfg:"timeout"`
 		Keepalive int      `gcfg:"keepalive"`
 	}
+	Clientprofile map[string]*ClientProfile
 }
 
 func ReadConfig(cfgFile string) *BurrowConfig {
@@ -186,6 +193,25 @@ func ValidateConfig(app *ApplicationContext) error {
 		}
 	}
 
+	// Kafka Client Profiles
+	// Set up a default profile, if needed
+	if _, ok := app.Config.Clientprofile["default"]; !ok {
+		app.Config.Clientprofile["default"] = &ClientProfile{
+			ClientID: app.Config.General.ClientID,
+			TLS:      false,
+		}
+	}
+
+	for name, cfg := range app.Config.Clientprofile {
+		if cfg.ClientID == "" {
+			cfg.ClientID = "burrow-client"
+		} else {
+			if !validateTopic(cfg.ClientID) {
+				errs = append(errs, fmt.Sprintf("Kafka client ID is not valid for profile %s", name))
+			}
+		}
+	}
+
 	// Kafka Clusters
 	if len(app.Config.Kafka) == 0 {
 		errs = append(errs, "No Kafka clusters are configured")
@@ -229,6 +255,13 @@ func ValidateConfig(app *ApplicationContext) error {
 		} else {
 			if !validateTopic(cfg.OffsetsTopic) {
 				errs = append(errs, fmt.Sprintf("Kafka offsets topic is not valid for cluster %s", cluster))
+			}
+		}
+		if cfg.Clientprofile == "" {
+			cfg.Clientprofile = "default"
+		} else {
+			if _, ok := app.Config.Clientprofile[cfg.Clientprofile]; !ok {
+				errs = append(errs, fmt.Sprintf("Kafka client profile is not defined for cluster %s", cluster))
 			}
 		}
 	}

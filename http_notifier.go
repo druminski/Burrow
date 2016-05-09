@@ -76,6 +76,7 @@ func NewHttpNotifier(app *ApplicationContext) (*HttpNotifier, error) {
 		"minus":           templateMinus,
 		"multiply":        templateMultiply,
 		"divide":          templateDivide,
+		"maxlag":          maxLagHelper,
 	}
 
 	// Compile the templates

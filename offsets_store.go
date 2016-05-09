@@ -101,6 +101,7 @@ type ConsumerGroupStatus struct {
 	Partitions      []*PartitionStatus `json:"partitions"`
 	TotalPartitions int                `json:"partition_count"`
 	Maxlag          *PartitionStatus   `json:"maxlag"`
+	TotalLag        uint64             `json:"totallag"`
 }
 
 type ResponseTopicList struct {
@@ -402,6 +403,7 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 		Complete:   true,
 		Partitions: make([]*PartitionStatus, 0),
 		Maxlag:     nil,
+		TotalLag:   0,
 	}
 
 	// Make sure the cluster exists
@@ -508,7 +510,9 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 			// Check if this partition is the one with the most lag currently
 			if lastOffset.Lag > maxlag {
 				status.Maxlag = thispart
+				maxlag = lastOffset.Lag
 			}
+			status.TotalLag += uint64(lastOffset.Lag)
 
 			// Rule 4 - Offsets haven't been committed in a while
 			if ((time.Now().Unix() * 1000) - lastOffset.Timestamp) > (lastOffset.Timestamp - firstOffset.Timestamp) {
