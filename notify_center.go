@@ -12,8 +12,13 @@ package main
 
 import (
 	log "github.com/cihub/seelog"
+	"github.com/linkedin/Burrow/notifier"
+	"github.com/linkedin/Burrow/protocol"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,16 +26,16 @@ import (
 type NotifyCenter struct {
 	app            *ApplicationContext
 	interval       int64
-	notifiers      []Notifier
+	notifiers      []notifier.Notifier
 	refreshTicker  *time.Ticker
 	quitChan       chan struct{}
 	groupList      map[string]map[string]bool
 	groupLock      sync.RWMutex
-	resultsChannel chan *ConsumerGroupStatus
+	resultsChannel chan *protocol.ConsumerGroupStatus
 }
 
 func LoadNotifiers(app *ApplicationContext) error {
-	notifiers := []Notifier{}
+	notifiers := []notifier.Notifier{}
 	if app.Config.Httpnotifier.Enable {
 		if httpNotifier, err := NewHttpNotifier(app); err == nil {
 			notifiers = append(notifiers, httpNotifier)
@@ -56,7 +61,7 @@ func LoadNotifiers(app *ApplicationContext) error {
 		quitChan:       make(chan struct{}),
 		groupList:      make(map[string]map[string]bool),
 		groupLock:      sync.RWMutex{},
-		resultsChannel: make(chan *ConsumerGroupStatus),
+		resultsChannel: make(chan *protocol.ConsumerGroupStatus),
 	}
 
 	app.NotifyCenter = nc
@@ -106,41 +111,42 @@ func StopNotifiers(app *ApplicationContext) {
 	// TODO stop all ncs
 }
 
-func (nc *NotifyCenter) handleEvaluationResponse(result *ConsumerGroupStatus) {
+func (nc *NotifyCenter) handleEvaluationResponse(result *protocol.ConsumerGroupStatus) {
+	msg := notifier.Message(*result)
 	for _, notifier := range nc.notifiers {
-		if !notifier.Ignore(result) {
-			notifier.Notify(result)
+		if !notifier.Ignore(msg) {
+			notifier.Notify(msg)
 		}
 	}
 }
 
-func (notifier *NotifyCenter) refreshConsumerGroups() {
-	notifier.groupLock.Lock()
-	defer notifier.groupLock.Unlock()
+func (nc *NotifyCenter) refreshConsumerGroups() {
+	nc.groupLock.Lock()
+	defer nc.groupLock.Unlock()
 
-	for cluster, _ := range notifier.app.Config.Kafka {
-		clusterGroups, ok := notifier.groupList[cluster]
+	for cluster, _ := range nc.app.Config.Kafka {
+		clusterGroups, ok := nc.groupList[cluster]
 		if !ok {
-			notifier.groupList[cluster] = make(map[string]bool)
-			clusterGroups = notifier.groupList[cluster]
+			nc.groupList[cluster] = make(map[string]bool)
+			clusterGroups = nc.groupList[cluster]
 		}
 
 		// Get a current list of consumer groups
 		storageRequest := &RequestConsumerList{Result: make(chan []string), Cluster: cluster}
-		notifier.app.Storage.requestChannel <- storageRequest
+		nc.app.Storage.requestChannel <- storageRequest
 		consumerGroups := <-storageRequest.Result
 
 		// Check for new groups, mark existing groups true
 		for _, consumerGroup := range consumerGroups {
 			// Don't bother adding groups in the blacklist
-			if (notifier.app.Storage.groupBlacklist != nil) && notifier.app.Storage.groupBlacklist.MatchString(consumerGroup) {
+			if (nc.app.Storage.groupBlacklist != nil) && nc.app.Storage.groupBlacklist.MatchString(consumerGroup) {
 				continue
 			}
 
 			if _, ok := clusterGroups[consumerGroup]; !ok {
 				// Add new consumer group and start checking it
 				log.Infof("Start evaluating consumer group %s in cluster %s", consumerGroup, cluster)
-				go notifier.startConsumerGroupEvaluator(consumerGroup, cluster)
+				go nc.startConsumerGroupEvaluator(consumerGroup, cluster)
 			}
 			clusterGroups[consumerGroup] = true
 		}
@@ -155,25 +161,102 @@ func (notifier *NotifyCenter) refreshConsumerGroups() {
 	}
 }
 
-func (notifier *NotifyCenter) startConsumerGroupEvaluator(group string, cluster string) {
+func (nc *NotifyCenter) startConsumerGroupEvaluator(group string, cluster string) {
 	// Sleep for a random portion of the check interval
-	time.Sleep(time.Duration(rand.Int63n(notifier.interval*1000)) * time.Millisecond)
+	time.Sleep(time.Duration(rand.Int63n(nc.interval*1000)) * time.Millisecond)
 
 	for {
 		// Make sure this group still exists
-		notifier.groupLock.RLock()
-		if _, ok := notifier.groupList[cluster][group]; !ok {
-			notifier.groupLock.RUnlock()
+		nc.groupLock.RLock()
+		if _, ok := nc.groupList[cluster][group]; !ok {
+			nc.groupLock.RUnlock()
 			log.Debugf("Stopping evaluator for consumer group %s in cluster %s", group, cluster)
 			break
 		}
-		notifier.groupLock.RUnlock()
+		nc.groupLock.RUnlock()
 
 		// Send requests for group status - responses are handled by the main loop (for now)
-		storageRequest := &RequestConsumerStatus{Result: notifier.resultsChannel, Cluster: cluster, Group: group}
-		notifier.app.Storage.requestChannel <- storageRequest
+		storageRequest := &RequestConsumerStatus{Result: nc.resultsChannel, Cluster: cluster, Group: group}
+		nc.app.Storage.requestChannel <- storageRequest
 
 		// Sleep for the check interval
-		time.Sleep(time.Duration(notifier.interval) * time.Second)
+		time.Sleep(time.Duration(nc.interval) * time.Second)
 	}
+}
+
+func NewEmailNotifier(app *ApplicationContext) ([]*notifier.EmailNotifier, error) {
+	log.Info("Start email notify")
+	emailers := []*notifier.EmailNotifier{}
+	for to, cfg := range app.Config.Emailnotifier {
+		if cfg.Enable {
+			emailer := &notifier.EmailNotifier{
+				Threshold:    cfg.Threshold,
+				TemplateFile: app.Config.Smtp.Template,
+				Server:       app.Config.Smtp.Server,
+				Port:         app.Config.Smtp.Port,
+				Username:     app.Config.Smtp.Username,
+				Password:     app.Config.Smtp.Password,
+				AuthType:     app.Config.Smtp.AuthType,
+				Interval:     cfg.Interval,
+				From:         app.Config.Smtp.From,
+				To:           to,
+				Groups:       cfg.Groups,
+			}
+			emailers = append(emailers, emailer)
+		}
+	}
+
+	return emailers, nil
+}
+
+func NewHttpNotifier(app *ApplicationContext) (*notifier.HttpNotifier, error) {
+	httpConfig := app.Config.Httpnotifier
+
+	// Parse the extra parameters for the templates
+	extras := make(map[string]string)
+	for _, extra := range httpConfig.Extras {
+		parts := strings.Split(extra, "=")
+		extras[parts[0]] = parts[1]
+	}
+
+	return &notifier.HttpNotifier{
+		Url:                httpConfig.Url,
+		Threshold:          httpConfig.PostThreshold,
+		SendDelete:         httpConfig.SendDelete,
+		TemplatePostFile:   httpConfig.TemplatePost,
+		TemplateDeleteFile: httpConfig.TemplateDelete,
+		Extras:             extras,
+		HttpClient: &http.Client{
+			Timeout: time.Duration(httpConfig.Timeout) * time.Second,
+			Transport: &http.Transport{
+				Dial: (&net.Dialer{
+					KeepAlive: time.Duration(httpConfig.Keepalive) * time.Second,
+				}).Dial,
+				Proxy: http.ProxyFromEnvironment,
+			},
+		},
+	}, nil
+}
+
+func NewSlackNotifier(app *ApplicationContext) (*notifier.SlackNotifier, error) {
+	log.Info("Start Slack Notify")
+
+	return &notifier.SlackNotifier{
+		Url:       app.Config.Slacknotifier.Url,
+		Groups:    app.Config.Slacknotifier.Groups,
+		Threshold: app.Config.Slacknotifier.Threshold,
+		Channel:   app.Config.Slacknotifier.Channel,
+		Username:  app.Config.Slacknotifier.Username,
+		IconUrl:   app.Config.Slacknotifier.IconUrl,
+		IconEmoji: app.Config.Slacknotifier.IconEmoji,
+		HttpClient: &http.Client{
+			Timeout: time.Duration(app.Config.Slacknotifier.Timeout) * time.Second,
+			Transport: &http.Transport{
+				Dial: (&net.Dialer{
+					KeepAlive: time.Duration(app.Config.Slacknotifier.Keepalive) * time.Second,
+				}).Dial,
+				Proxy: http.ProxyFromEnvironment,
+			},
+		},
+	}, nil
 }
