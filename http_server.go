@@ -16,6 +16,7 @@ import (
 	"github.com/linkedin/Burrow/protocol"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -84,15 +85,90 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "GOOD")
 }
 
+type HTTPResponseRequestInfo struct {
+	URI     string `json:"url"`
+	Host    string `json:"host"`
+	Cluster string `json:"cluster"`
+	Group   string `json:"group"`
+	Topic   string `json:"topic"`
+}
+type HTTPResponseError struct {
+	Error   bool                    `json:"error"`
+	Message string                  `json:"message"`
+	Result  map[string]string       `json:"result"`
+	Request HTTPResponseRequestInfo `json:"request"`
+}
+type HTTPResponseClusterDetailCluster struct {
+	Zookeepers    []string `json:"zookeepers"`
+	ZookeeperPort int      `json:"zookeeper_port"`
+	ZookeeperPath string   `json:"zookeeper_path"`
+	Brokers       []string `json:"brokers"`
+	BrokerPort    int      `json:"broker_port"`
+	OffsetsTopic  string   `json:"offsets_topic"`
+}
+type HTTPResponseClusterDetail struct {
+	Error   bool                             `json:"error"`
+	Message string                           `json:"message"`
+	Cluster HTTPResponseClusterDetailCluster `json:"cluster"`
+	Request HTTPResponseRequestInfo          `json:"request"`
+}
 type HTTPResponseClusterList struct {
-	Error    bool     `json:"error"`
-	Message  string   `json:"message"`
-	Clusters []string `json:"clusters"`
+	Error    bool                    `json:"error"`
+	Message  string                  `json:"message"`
+	Clusters []string                `json:"clusters"`
+	Request  HTTPResponseRequestInfo `json:"request"`
+}
+type HTTPResponseTopicList struct {
+	Error   bool                    `json:"error"`
+	Message string                  `json:"message"`
+	Topics  []string                `json:"topics"`
+	Request HTTPResponseRequestInfo `json:"request"`
+}
+type HTTPResponseTopicDetail struct {
+	Error   bool                    `json:"error"`
+	Message string                  `json:"message"`
+	Offsets []int64                 `json:"offsets"`
+	Request HTTPResponseRequestInfo `json:"request"`
+}
+type HTTPResponseConsumerList struct {
+	Error     bool                    `json:"error"`
+	Message   string                  `json:"message"`
+	Consumers []string                `json:"consumers"`
+	Request   HTTPResponseRequestInfo `json:"request"`
+}
+type HTTPResponseConsumerStatus struct {
+	Error   bool                         `json:"error"`
+	Message string                       `json:"message"`
+	Status  protocol.ConsumerGroupStatus `json:"status"`
+	Request HTTPResponseRequestInfo      `json:"request"`
+}
+
+func makeRequestInfo(r *http.Request) HTTPResponseRequestInfo {
+	hostname, _ := os.Hostname()
+	return HTTPResponseRequestInfo{
+		URI:  r.URL.Path,
+		Host: hostname,
+	}
+}
+func makeErrorResponse(errValue int, message string, w http.ResponseWriter, r *http.Request) (int, string) {
+	rv := HTTPResponseError{
+		Error:   true,
+		Message: message,
+		Request: makeRequestInfo(r),
+	}
+
+	jsonStr, err := json.Marshal(rv)
+	if err != nil {
+		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
+	} else {
+		w.Write(jsonStr)
+		return errValue, ""
+	}
 }
 
 func handleClusterList(app *ApplicationContext, w http.ResponseWriter, r *http.Request) (int, string) {
 	if r.Method != "GET" {
-		return http.StatusMethodNotAllowed, "{\"error\":true,\"message\":\"request method not supported\",\"result\":{}}"
+		return makeErrorResponse(http.StatusMethodNotAllowed, "request method not supported", w, r)
 	}
 
 	clusterList := make([]string, len(app.Config.Kafka))
@@ -101,10 +177,12 @@ func handleClusterList(app *ApplicationContext, w http.ResponseWriter, r *http.R
 		clusterList[i] = cluster
 		i++
 	}
+	requestInfo := makeRequestInfo(r)
 	jsonStr, err := json.Marshal(HTTPResponseClusterList{
 		Error:    false,
 		Message:  "cluster list returned",
 		Clusters: clusterList,
+		Request:  requestInfo,
 	})
 	if err != nil {
 		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
@@ -118,14 +196,14 @@ func handleClusterList(app *ApplicationContext, w http.ResponseWriter, r *http.R
 func handleKafka(app *ApplicationContext, w http.ResponseWriter, r *http.Request) (int, string) {
 	pathParts := strings.Split(r.URL.Path[1:], "/")
 	if _, ok := app.Config.Kafka[pathParts[2]]; !ok {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"cluster not found\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "cluster not found", w, r)
 	}
 	if pathParts[2] == "" {
 		// Allow a trailing / on requests
 		return handleClusterList(app, w, r)
 	}
 	if (len(pathParts) == 3) || (pathParts[3] == "") {
-		return handleClusterDetail(app, w, pathParts[2])
+		return handleClusterDetail(app, w, r, pathParts[2])
 	}
 
 	switch pathParts[3] {
@@ -134,72 +212,61 @@ func handleKafka(app *ApplicationContext, w http.ResponseWriter, r *http.Request
 		case r.Method == "DELETE":
 			switch {
 			case (len(pathParts) == 5) || (pathParts[5] == ""):
-				return handleConsumerDrop(app, w, pathParts[2], pathParts[4])
+				return handleConsumerDrop(app, w, r, pathParts[2], pathParts[4])
 			default:
-				return http.StatusMethodNotAllowed, "{\"error\":true,\"message\":\"request method not supported\",\"result\":{}}"
+				return makeErrorResponse(http.StatusMethodNotAllowed, "request method not supported", w, r)
 			}
 		case r.Method == "GET":
 			switch {
 			case (len(pathParts) == 4) || (pathParts[4] == ""):
-				return handleConsumerList(app, w, pathParts[2])
+				return handleConsumerList(app, w, r, pathParts[2])
 			case (len(pathParts) == 5) || (pathParts[5] == ""):
 				// Consumer detail - list of consumer streams/hosts? Can be config info later
-				return http.StatusNotFound, "{\"error\":true,\"message\":\"unknown API call\",\"result\":{}}"
+				return makeErrorResponse(http.StatusNotFound, "unknown API call", w, r)
 			case pathParts[5] == "topic":
 				switch {
 				case (len(pathParts) == 6) || (pathParts[6] == ""):
-					return handleConsumerTopicList(app, w, pathParts[2], pathParts[4])
+					return handleConsumerTopicList(app, w, r, pathParts[2], pathParts[4])
 				case (len(pathParts) == 7) || (pathParts[7] == ""):
-					return handleConsumerTopicDetail(app, w, pathParts[2], pathParts[4], pathParts[6])
+					return handleConsumerTopicDetail(app, w, r, pathParts[2], pathParts[4], pathParts[6])
 				}
 			case pathParts[5] == "status":
-				return handleConsumerStatus(app, w, pathParts[2], pathParts[4], false)
+				return handleConsumerStatus(app, w, r, pathParts[2], pathParts[4], false)
 			case pathParts[5] == "lag":
-				return handleConsumerStatus(app, w, pathParts[2], pathParts[4], true)
+				return handleConsumerStatus(app, w, r, pathParts[2], pathParts[4], true)
 			}
 		default:
-			return http.StatusMethodNotAllowed, "{\"error\":true,\"message\":\"request method not supported\",\"result\":{}}"
+			return makeErrorResponse(http.StatusMethodNotAllowed, "request method not supported", w, r)
 		}
 	case "topic":
 		switch {
 		case r.Method != "GET":
-			return http.StatusMethodNotAllowed, "{\"error\":true,\"message\":\"request method not supported\",\"result\":{}}"
+			return makeErrorResponse(http.StatusMethodNotAllowed, "request method not supported", w, r)
 		case (len(pathParts) == 4) || (pathParts[4] == ""):
-			return handleBrokerTopicList(app, w, pathParts[2])
+			return handleBrokerTopicList(app, w, r, pathParts[2])
 		case (len(pathParts) == 5) || (pathParts[5] == ""):
-			return handleBrokerTopicDetail(app, w, pathParts[2], pathParts[4])
+			return handleBrokerTopicDetail(app, w, r, pathParts[2], pathParts[4])
 		}
 	case "offsets":
 		// Reserving this endpoint to implement later
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"unknown API call\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "unknown API call", w, r)
 	}
 
 	// If we fell through, return a 404
-	return http.StatusNotFound, "{\"error\":true,\"message\":\"unknown API call\",\"result\":{}}"
+	return makeErrorResponse(http.StatusNotFound, "unknown API call", w, r)
 }
 
-type HTTPResponseClusterDetailCluster struct {
-	Zookeepers    []string `json:"zookeepers"`
-	ZookeeperPort int      `json:"zookeeper_port"`
-	ZookeeperPath string   `json:"zookeeper_path"`
-	Brokers       []string `json:"brokers"`
-	BrokerPort    int      `json:"broker_port"`
-	OffsetsTopic  string   `json:"offsets_topic"`
-}
-type HTTPResponseClusterDetail struct {
-	Error   bool                             `json:"error"`
-	Message string                           `json:"message"`
-	Cluster HTTPResponseClusterDetailCluster `json:"cluster"`
-}
-
-func handleClusterDetail(app *ApplicationContext, w http.ResponseWriter, cluster string) (int, string) {
+func handleClusterDetail(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string) (int, string) {
 	// Clearly show the root path in ZK (which we have a blank for after config)
 	zkPath := app.Config.Kafka[cluster].ZookeeperPath
 	if zkPath == "" {
 		zkPath = "/"
 	}
 
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
 	jsonStr, err := json.Marshal(HTTPResponseClusterDetail{
+		Request: requestInfo,
 		Error:   false,
 		Message: "cluster detail returned",
 		Cluster: HTTPResponseClusterDetailCluster{
@@ -219,15 +286,15 @@ func handleClusterDetail(app *ApplicationContext, w http.ResponseWriter, cluster
 	return 200, ""
 }
 
-func handleConsumerList(app *ApplicationContext, w http.ResponseWriter, cluster string) (int, string) {
+func handleConsumerList(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string) (int, string) {
 	storageRequest := &RequestConsumerList{Result: make(chan []string), Cluster: cluster}
 	app.Storage.requestChannel <- storageRequest
-	jsonStr, err := json.Marshal(struct {
-		Error     bool     `json:"error"`
-		Message   string   `json:"message"`
-		Consumers []string `json:"consumers"`
-	}{
+
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
+	jsonStr, err := json.Marshal(HTTPResponseConsumerList{
 		Error:     false,
+		Request:   requestInfo,
 		Message:   "consumer list returned",
 		Consumers: <-storageRequest.Result,
 	})
@@ -240,23 +307,22 @@ func handleConsumerList(app *ApplicationContext, w http.ResponseWriter, cluster 
 	return 200, ""
 }
 
-type HTTPResponseTopicList struct {
-	Error   bool     `json:"error"`
-	Message string   `json:"message"`
-	Topics  []string `json:"topics"`
-}
-
-func handleConsumerTopicList(app *ApplicationContext, w http.ResponseWriter, cluster string, group string) (int, string) {
+func handleConsumerTopicList(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string, group string) (int, string) {
 	storageRequest := &RequestTopicList{Result: make(chan *ResponseTopicList), Cluster: cluster, Group: group}
 	app.Storage.requestChannel <- storageRequest
 	result := <-storageRequest.Result
 	if result.Error {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"consumer group not found\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "consumer group not found", w, r)
 	}
+
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
+	requestInfo.Group = group
 	jsonStr, err := json.Marshal(HTTPResponseTopicList{
 		Error:   false,
 		Message: "consumer topic list returned",
 		Topics:  result.TopicList,
+		Request: requestInfo,
 	})
 	if err != nil {
 		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
@@ -265,26 +331,26 @@ func handleConsumerTopicList(app *ApplicationContext, w http.ResponseWriter, clu
 	return 200, ""
 }
 
-type HTTPResponseTopicDetail struct {
-	Error   bool    `json:"error"`
-	Message string  `json:"message"`
-	Offsets []int64 `json:"offsets"`
-}
-
-func handleConsumerTopicDetail(app *ApplicationContext, w http.ResponseWriter, cluster string, group string, topic string) (int, string) {
+func handleConsumerTopicDetail(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string, group string, topic string) (int, string) {
 	storageRequest := &RequestOffsets{Result: make(chan *ResponseOffsets), Cluster: cluster, Topic: topic, Group: group}
 	app.Storage.requestChannel <- storageRequest
 	result := <-storageRequest.Result
 	if result.ErrorGroup {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"consumer group not found\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "consumer group not found", w, r)
 	}
 	if result.ErrorTopic {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"topic not found for consumer group\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "topic not found for consumer group", w, r)
 	}
+
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
+	requestInfo.Group = group
+	requestInfo.Topic = topic
 	jsonStr, err := json.Marshal(HTTPResponseTopicDetail{
 		Error:   false,
 		Message: "consumer group topic offsets returned",
 		Offsets: result.OffsetList,
+		Request: requestInfo,
 	})
 	if err != nil {
 		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
@@ -294,13 +360,7 @@ func handleConsumerTopicDetail(app *ApplicationContext, w http.ResponseWriter, c
 	return 200, ""
 }
 
-type HTTPResponseConsumerStatus struct {
-	Error   bool                         `json:"error"`
-	Message string                       `json:"message"`
-	Status  protocol.ConsumerGroupStatus `json:"status"`
-}
-
-func handleConsumerStatus(app *ApplicationContext, w http.ResponseWriter, cluster string, group string, showall bool) (int, string) {
+func handleConsumerStatus(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string, group string, showall bool) (int, string) {
 	storageRequest := &RequestConsumerStatus{
 		Result:  make(chan *protocol.ConsumerGroupStatus),
 		Cluster: cluster,
@@ -310,12 +370,17 @@ func handleConsumerStatus(app *ApplicationContext, w http.ResponseWriter, cluste
 	app.Storage.requestChannel <- storageRequest
 	result := <-storageRequest.Result
 	if result.Status == protocol.StatusNotFound {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"consumer group not found\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "consumer group not found", w, r)
 	}
+
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
+	requestInfo.Group = group
 	jsonStr, err := json.Marshal(HTTPResponseConsumerStatus{
 		Error:   false,
 		Message: "consumer group status returned",
 		Status:  *result,
+		Request: requestInfo,
 	})
 	if err != nil {
 		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
@@ -324,29 +389,42 @@ func handleConsumerStatus(app *ApplicationContext, w http.ResponseWriter, cluste
 	return 200, ""
 }
 
-func handleConsumerDrop(app *ApplicationContext, w http.ResponseWriter, cluster string, group string) (int, string) {
-	storageRequest := &RequestConsumerDrop{
-		Result:  make(chan protocol.StatusConstant),
-		Cluster: cluster,
-		Group:   group,
-	}
+func handleConsumerDrop(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string, group string) (int, string) {
+	storageRequest := &RequestConsumerDrop{Result: make(chan protocol.StatusConstant), Cluster: cluster, Group: group}
 	app.Storage.requestChannel <- storageRequest
 	result := <-storageRequest.Result
 	if result == protocol.StatusNotFound {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"consumer group not found\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "consumer group not found", w, r)
 	}
 
-	return 200, "{\"error\":false,\"message\":\"consumer group removed\",\"result\":{}}"
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
+	requestInfo.Group = group
+	jsonStr, err := json.Marshal(HTTPResponseError{
+		Error:   false,
+		Message: "consumer group removed",
+		Request: requestInfo,
+	})
+	if err != nil {
+		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
+	} else {
+		w.Write(jsonStr)
+		return 200, ""
+	}
 }
 
-func handleBrokerTopicList(app *ApplicationContext, w http.ResponseWriter, cluster string) (int, string) {
+func handleBrokerTopicList(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string) (int, string) {
 	storageRequest := &RequestTopicList{Result: make(chan *ResponseTopicList), Cluster: cluster}
 	app.Storage.requestChannel <- storageRequest
 	result := <-storageRequest.Result
+
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
 	jsonStr, err := json.Marshal(HTTPResponseTopicList{
 		Error:   false,
 		Message: "broker topic list returned",
 		Topics:  result.TopicList,
+		Request: requestInfo,
 	})
 	if err != nil {
 		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
@@ -356,17 +434,22 @@ func handleBrokerTopicList(app *ApplicationContext, w http.ResponseWriter, clust
 	return 200, ""
 }
 
-func handleBrokerTopicDetail(app *ApplicationContext, w http.ResponseWriter, cluster string, topic string) (int, string) {
+func handleBrokerTopicDetail(app *ApplicationContext, w http.ResponseWriter, r *http.Request, cluster string, topic string) (int, string) {
 	storageRequest := &RequestOffsets{Result: make(chan *ResponseOffsets), Cluster: cluster, Topic: topic}
 	app.Storage.requestChannel <- storageRequest
 	result := <-storageRequest.Result
 	if result.ErrorTopic {
-		return http.StatusNotFound, "{\"error\":true,\"message\":\"topic not found\",\"result\":{}}"
+		return makeErrorResponse(http.StatusNotFound, "topic not found", w, r)
 	}
+
+	requestInfo := makeRequestInfo(r)
+	requestInfo.Cluster = cluster
+	requestInfo.Topic = topic
 	jsonStr, err := json.Marshal(HTTPResponseTopicDetail{
 		Error:   false,
 		Message: "broker topic offsets returned",
 		Offsets: result.OffsetList,
+		Request: requestInfo,
 	})
 	if err != nil {
 		return http.StatusInternalServerError, "{\"error\":true,\"message\":\"could not encode JSON\",\"result\":{}}"
