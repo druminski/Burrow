@@ -12,13 +12,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"github.com/Shopify/sarama"
 	log "github.com/cihub/seelog"
+	"github.com/linkedin/Burrow/protocol"
 	"sync"
 	"time"
-	"crypto/tls"
 )
 
 type KafkaClient struct {
@@ -160,7 +161,7 @@ func (client *KafkaClient) Stop() {
 }
 
 // Send the offset on the specified channel, but wait no more than maxTime seconds to do so
-func timeoutSendOffset(offsetChannel chan *PartitionOffset, offset *PartitionOffset, maxTime int) {
+func timeoutSendOffset(offsetChannel chan *protocol.PartitionOffset, offset *protocol.PartitionOffset, maxTime int) {
 	timeout := time.After(time.Duration(maxTime) * time.Second)
 	select {
 	case offsetChannel <- offset:
@@ -214,7 +215,7 @@ func (client *KafkaClient) getOffsets() error {
 					log.Warnf("Error in OffsetResponse for %s:%v from broker %v: %s", topic, partition, brokerID, offsetResponse.Err.Error())
 					continue
 				}
-				offset := &PartitionOffset{
+				offset := &protocol.PartitionOffset{
 					Cluster:             client.cluster,
 					Topic:               topic,
 					Partition:           partition,
@@ -327,7 +328,7 @@ func (client *KafkaClient) processConsumerOffsetsMessage(msg *sarama.ConsumerMes
 	}
 
 	// fmt.Printf("[%s,%s,%v]::OffsetAndMetadata[%v,%s,%v]\n", group, topic, partition, offset, metadata, timestamp)
-	partitionOffset := &PartitionOffset{
+	partitionOffset := &protocol.PartitionOffset{
 		Cluster:   client.cluster,
 		Topic:     topic,
 		Partition: int32(partition),
